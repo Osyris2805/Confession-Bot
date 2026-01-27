@@ -9,15 +9,15 @@ import asyncio
 import re
 
 # =======================
-# CONFIG (EDIT THESE)
+# CONFIG 
 # =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
 
-GUILD_ID = 417323686018940928          # your server ID
-CONFESSION_CHANNEL_ID = 1461951872364449984  # where confessions are posted
-LOG_CHANNEL_ID = 1461951962965868680         # staff-only logs channel
+GUILD_ID = 417323686018940928         
+CONFESSION_CHANNEL_ID = 1461951872364449984  
+LOG_CHANNEL_ID = 1461951962965868680         
 
 DATA_FILE = "confessions.json"
 # =======================
@@ -27,13 +27,13 @@ data_lock = asyncio.Lock()
 
 
 # -----------------------
-# JSON HELPERS (SAFE)
+# JSON HELPERS 
 # -----------------------
 def _default_data():
     return {
         "confession_count": 0,
-        "confessions": {},              # str(confession_id) -> data
-        "message_to_confession": {}     # str(message_id) -> confession_id (int)
+        "confessions": {},              
+        "message_to_confession": {}     
     }
 
 def load_data():
@@ -42,12 +42,12 @@ def load_data():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # ensure keys exist
+     
         for k, v in _default_data().items():
             data.setdefault(k, v)
         return data
     except Exception:
-        # if file corrupted, do not crash bot
+    
         return _default_data()
 
 def save_data_atomic(data):
@@ -90,12 +90,12 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
         if not text:
             return await interaction.response.send_message("❌ Empty confession.", ephemeral=True)
 
-        # reserve confession id + save
+      
         async with data_lock:
             DATA["confession_count"] += 1
             cid = int(DATA["confession_count"])
 
-        # PUBLIC EMBED
+        
         confession_embed = discord.Embed(
             title=f"Anonymous Confession (#{cid})",
             description=f"“{text}”",
@@ -104,10 +104,10 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
         )
         confession_embed.set_footer(text="Use the buttons below to submit or reply anonymously.")
 
-        # Send with persistent buttons
+       
         msg = await confession_channel.send(embed=confession_embed, view=ConfessionPersistentView())
 
-        # Save full record
+      
         async with data_lock:
             DATA["confessions"][str(cid)] = {
                 "content": text,
@@ -124,7 +124,7 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
             DATA["message_to_confession"][str(msg.id)] = cid
             save_data_atomic(DATA)
 
-        # LOG EMBED (ADVANCED)
+        
         log_embed = discord.Embed(
             title=f"🔒 Confession #{cid} — Log",
             color=0xED4245,
@@ -176,7 +176,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
 
         cid = int(self.confession_id)
 
-        # Save reply to JSON first
+        
         async with data_lock:
             rec = DATA["confessions"].get(str(cid))
             if not rec:
@@ -191,7 +191,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
             rec["replies"].append(reply_obj)
             save_data_atomic(DATA)
 
-        # Try to post reply in a thread under the confession (advanced)
+        
         posted_somewhere = False
         try:
             thread_id = rec.get("thread_id")
@@ -201,7 +201,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
                 thread = guild.get_thread(int(thread_id))
 
             if thread is None:
-                # create thread from the confession message
+                
                 thread = await self.confession_message.create_thread(
                     name=f"Replies #{cid}",
                     auto_archive_duration=1440
@@ -219,7 +219,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
             await thread.send(embed=reply_embed, allowed_mentions=discord.AllowedMentions.none())
             posted_somewhere = True
         except Exception:
-            # fallback: send reply in confession channel (no crash)
+           
             try:
                 reply_embed = discord.Embed(
                     title=f"Anonymous Reply → Confession #{cid}",
@@ -232,7 +232,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
             except Exception:
                 posted_somewhere = False
 
-        # Log reply (advanced)
+        
         log_embed = discord.Embed(
             title=f"🔒 Reply to Confession #{cid} — Log",
             color=0xFEE75C,
@@ -258,7 +258,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
 
 
 # -----------------------
-# PERSISTENT VIEW (NO ERRORS)
+# PERSISTENT VIEW 
 # -----------------------
 class ConfessionPersistentView(ui.View):
     def __init__(self):
@@ -280,7 +280,7 @@ class ConfessionPersistentView(ui.View):
         custom_id="confession:reply"
     )
     async def reply(self, interaction: discord.Interaction, button: ui.Button):
-        # Identify confession by message_id mapping (works after restarts)
+       
         message = interaction.message
         if message is None:
             return await interaction.response.send_message("❌ No message context.", ephemeral=True)
@@ -289,7 +289,7 @@ class ConfessionPersistentView(ui.View):
         async with data_lock:
             cid = DATA["message_to_confession"].get(str(message.id))
 
-        # fallback: parse embed title
+       
         if cid is None and message.embeds:
             title = message.embeds[0].title or ""
             m = CONF_ID_RE.search(title)
@@ -310,7 +310,7 @@ class ConfessionPersistentView(ui.View):
 # -----------------------
 class HiraBot(commands.Bot):
     async def setup_hook(self):
-        # Register persistent view correctly (NO ValueError)
+     
         self.add_view(ConfessionPersistentView())
 
 bot = HiraBot(command_prefix="!", intents=discord.Intents.all())
@@ -321,7 +321,7 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
 
-# One-time panel message like your screenshot (run !panel in the channel you want)
+
 @bot.command(name="panel")
 @commands.has_permissions(administrator=True)
 async def panel(ctx: commands.Context):
@@ -334,7 +334,7 @@ async def panel(ctx: commands.Context):
     await ctx.send(embed=embed, view=ConfessionPersistentView())
 
 
-# Optional: rebuild mapping if you deleted JSON keys or changed files
+
 @bot.command(name="rebuildmap")
 @commands.has_permissions(administrator=True)
 async def rebuildmap(ctx: commands.Context):
@@ -351,3 +351,4 @@ async def rebuildmap(ctx: commands.Context):
 
 
 bot.run(TOKEN)
+
