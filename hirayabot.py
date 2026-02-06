@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 from discord import ui
 from discord.utils import escape_mentions
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import asyncio
@@ -17,6 +17,10 @@ DATA_FILE = "confessions.json"
 CONF_ID_RE = re.compile(r"#(\d+)")
 SUGG_ID_RE = re.compile(r"#(\d+)")
 data_lock = asyncio.Lock()
+
+PENDING_IMAGE = {}
+PENDING_IMAGE_LOCK = asyncio.Lock()
+PENDING_IMAGE_TTL_SECONDS = 60 * 30
 
 
 def _default_data():
@@ -96,10 +100,45 @@ def _rebuild_embed_from(embed: discord.Embed, *, fields, footer_text=None):
             new_embed.set_footer(text=embed.footer.text)
     else:
         new_embed.set_footer(text=footer_text)
-
     for name, value, inline in fields[:25]:
         new_embed.add_field(name=name, value=value, inline=inline)
     return new_embed
+
+
+async def _clean_expired_pending():
+    async with PENDING_IMAGE_LOCK:
+        now = datetime.utcnow().timestamp()
+        expired = [k for k, v in PENDING_IMAGE.items() if v["expires_at"] <= now]
+        for k in expired:
+            PENDING_IMAGE.pop(k, None)
+
+
+async def _set_pending_image(guild_id: int, suggestion_channel_id: int, suggestion_message_id: int, user_id: int):
+    async with PENDING_IMAGE_LOCK:
+        PENDING_IMAGE[(guild_id, suggestion_message_id)] = {
+            "guild_id": guild_id,
+            "channel_id": suggestion_channel_id,
+            "message_id": suggestion_message_id,
+            "user_id": user_id,
+            "created_at": datetime.utcnow().timestamp(),
+            "expires_at": (datetime.utcnow() + timedelta(seconds=PENDING_IMAGE_TTL_SECONDS)).timestamp()
+        }
+
+
+async def _clear_pending_image(guild_id: int, suggestion_message_id: int):
+    async with PENDING_IMAGE_LOCK:
+        PENDING_IMAGE.pop((guild_id, suggestion_message_id), None)
+
+
+async def _find_pending_for_user(guild_id: int, channel_id: int, user_id: int):
+    await _clean_expired_pending()
+    async with PENDING_IMAGE_LOCK:
+        matches = []
+        for (g, mid), v in PENDING_IMAGE.items():
+            if g == guild_id and v["channel_id"] == channel_id and v["user_id"] == user_id:
+                matches.append(v)
+        matches.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        return matches
 
 
 class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
@@ -377,7 +416,7 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
         embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
         embed.add_field(name="Status", value=f"**{status_label('pending')}**", inline=True)
         embed.add_field(name="Votes", value="👍 0  |  👎 0", inline=True)
-        embed.add_field(name="Attachment", value="Reply to this suggestion with **1 image** within **90s** (optional).", inline=False)
+        embed.add_field(name="Image", value="Use **Attach Image** or **No Image** below.", inline=False)
         embed.set_footer(text="Vote below • Mods can update status")
 
         msg = await suggestion_channel.send(embed=embed, view=SuggestionView())
@@ -418,49 +457,7 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
             except Exception:
                 pass
 
-        await interaction.response.send_message(
-            "✅ Posted! Optional image: reply to your suggestion message with an image within **90 seconds** (or ignore).",
-            ephemeral=True
-        )
-
-        try:
-            def check(m: discord.Message):
-                if m.author.id != interaction.user.id:
-                    return False
-                if m.channel.id != suggestion_channel.id:
-                    return False
-                if not m.attachments:
-                    return False
-                if m.reference is None or m.reference.message_id is None:
-                    return False
-                if int(m.reference.message_id) != int(msg.id):
-                    return False
-                return True
-
-            img_msg = await bot.wait_for("message", timeout=90.0, check=check)
-            attachment = img_msg.attachments[0]
-
-            async with data_lock:
-                rec = DATA["suggestions"].get(str(sid))
-                if rec:
-                    rec["image_url"] = attachment.url
-                    save_data_atomic(DATA)
-
-            try:
-                original = await suggestion_channel.fetch_message(msg.id)
-                if original and original.embeds:
-                    e = original.embeds[0]
-                    fields = [(f.name, f.value, f.inline) for f in e.fields]
-                    new_embed = _rebuild_embed_from(e, fields=fields)
-                    new_embed.set_image(url=attachment.url)
-                    await original.edit(embed=new_embed, view=SuggestionView())
-            except Exception:
-                pass
-
-        except asyncio.TimeoutError:
-            pass
-        except Exception:
-            pass
+        await interaction.response.send_message("✅ Posted! On your suggestion, press **Attach Image** or **No Image**.", ephemeral=True)
 
 
 class SuggestionStatusSelect(ui.Select):
@@ -537,6 +534,54 @@ class SuggestionView(ui.View):
     @ui.button(label="Downvote", emoji="👎", style=discord.ButtonStyle.danger, custom_id="suggestion:downvote")
     async def downvote(self, interaction: discord.Interaction, button: ui.Button):
         await self._vote(interaction, up=False)
+
+    @ui.button(label="Attach Image", emoji="🖼️", style=discord.ButtonStyle.primary, custom_id="suggestion:attach_image")
+    async def attach_image(self, interaction: discord.Interaction, button: ui.Button):
+        msg = interaction.message
+        if not msg or not interaction.guild:
+            return await interaction.response.send_message("❌ Missing context.", ephemeral=True)
+
+        guild = interaction.guild
+        async with data_lock:
+            sid = DATA["message_to_suggestion"].get(str(msg.id))
+            rec = DATA["suggestions"].get(str(sid)) if sid else None
+            cfg = get_guild_cfg(guild.id)
+            suggestion_channel_id = cfg.get("suggestion_channel_id")
+
+        if not sid or not rec:
+            return await interaction.response.send_message("❌ Can't detect this suggestion.", ephemeral=True)
+
+        is_owner = rec.get("user_id") == interaction.user.id
+        is_mod = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_guild
+        if not (is_owner or is_mod):
+            return await interaction.response.send_message("❌ Only the suggester (or a mod) can attach an image.", ephemeral=True)
+
+        if not suggestion_channel_id or int(suggestion_channel_id) != msg.channel.id:
+            return await interaction.response.send_message("❌ This suggestion is not in the configured suggestion channel.", ephemeral=True)
+
+        await _set_pending_image(guild.id, msg.channel.id, msg.id, rec.get("user_id"))
+        await interaction.response.send_message("🖼️ Send an image in this channel now — I’ll attach it to your latest suggestion.", ephemeral=True)
+
+    @ui.button(label="No Image", emoji="🚫", style=discord.ButtonStyle.secondary, custom_id="suggestion:no_image")
+    async def no_image(self, interaction: discord.Interaction, button: ui.Button):
+        msg = interaction.message
+        if not msg or not interaction.guild:
+            return await interaction.response.send_message("❌ Missing context.", ephemeral=True)
+
+        async with data_lock:
+            sid = DATA["message_to_suggestion"].get(str(msg.id))
+            rec = DATA["suggestions"].get(str(sid)) if sid else None
+
+        if not sid or not rec:
+            return await interaction.response.send_message("❌ Can't detect this suggestion.", ephemeral=True)
+
+        is_owner = rec.get("user_id") == interaction.user.id
+        is_mod = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_guild
+        if not (is_owner or is_mod):
+            return await interaction.response.send_message("❌ Only the suggester (or a mod) can choose this.", ephemeral=True)
+
+        await _clear_pending_image(interaction.guild.id, msg.id)
+        await interaction.response.send_message("✅ Got it — no image will be attached.", ephemeral=True)
 
     @ui.button(label="Open", emoji="🔗", style=discord.ButtonStyle.secondary, custom_id="suggestion:link")
     async def link(self, interaction: discord.Interaction, button: ui.Button):
@@ -620,9 +665,10 @@ class SuggestionPanelView(ui.View):
         await interaction.response.send_message(
             "1) Click **Submit Suggestion**\n"
             "2) Fill title + details\n"
-            "3) Optional: reply to your posted suggestion with **one image** within **90s**\n"
-            "4) Vote with 👍/👎\n"
-            "5) Mods update status using the dropdown",
+            "3) On your suggestion: press **Attach Image** or **No Image**\n"
+            "4) Send an image normally (no reply needed)\n"
+            "5) Vote with 👍/👎\n"
+            "6) Mods update status using the dropdown",
             ephemeral=True
         )
 
@@ -642,6 +688,74 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
 
+@bot.event
+async def on_message(message: discord.Message):
+    await bot.process_commands(message)
+
+    if message.author.bot:
+        return
+    if not message.guild:
+        return
+    if not message.attachments:
+        return
+
+    async with data_lock:
+        cfg = get_guild_cfg(message.guild.id)
+        suggestion_channel_id = cfg.get("suggestion_channel_id")
+
+    if not suggestion_channel_id:
+        return
+    if message.channel.id != int(suggestion_channel_id):
+        return
+
+    await _clean_expired_pending()
+
+    target_suggestion_message_id = None
+
+    if message.reference and message.reference.message_id:
+        ref_id = int(message.reference.message_id)
+        async with PENDING_IMAGE_LOCK:
+            key = (message.guild.id, ref_id)
+            pending = PENDING_IMAGE.get(key)
+            if pending and pending["user_id"] == message.author.id and pending["channel_id"] == message.channel.id:
+                target_suggestion_message_id = ref_id
+
+    if target_suggestion_message_id is None:
+        pending_list = await _find_pending_for_user(message.guild.id, message.channel.id, message.author.id)
+        if not pending_list:
+            return
+        target_suggestion_message_id = int(pending_list[0]["message_id"])
+
+    attachment = message.attachments[0]
+
+    async with data_lock:
+        sid = DATA["message_to_suggestion"].get(str(target_suggestion_message_id))
+        rec = DATA["suggestions"].get(str(sid)) if sid else None
+        if not sid or not rec:
+            await _clear_pending_image(message.guild.id, target_suggestion_message_id)
+            return
+        rec["image_url"] = attachment.url
+        save_data_atomic(DATA)
+
+    try:
+        suggestion_msg = await message.channel.fetch_message(target_suggestion_message_id)
+        if suggestion_msg and suggestion_msg.embeds:
+            e = suggestion_msg.embeds[0]
+            fields = [(f.name, f.value, f.inline) for f in e.fields]
+            new_embed = _rebuild_embed_from(e, fields=fields)
+            new_embed.set_image(url=attachment.url)
+            await suggestion_msg.edit(embed=new_embed, view=SuggestionView())
+    except Exception:
+        pass
+
+    await _clear_pending_image(message.guild.id, target_suggestion_message_id)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 @bot.command(name="panel")
 @commands.has_permissions(administrator=True)
 async def panel(ctx: commands.Context):
@@ -655,7 +769,7 @@ async def panel(ctx: commands.Context):
         description="Click **Submit a confession!** to post anonymously.\nUse **Reply** under a confession to reply anonymously.",
         color=0x57F287
     )
-    embed.set_footer(text="Admin note: this channel is now the confession channel for this server.")
+    embed.set_footer(text="This channel is now the confession channel for this server.")
     await ctx.send(embed=embed, view=ConfessionPersistentView())
 
 
@@ -669,14 +783,10 @@ async def suggestionpanel(ctx: commands.Context):
         save_data_atomic(DATA)
     embed = discord.Embed(
         title="✨ Suggestions Box",
-        description="Drop ideas to improve the server.\n\n"
-                    "💡 Submit an idea\n"
-                    "👍 Community votes\n"
-                    "🛠️ Mods set status\n"
-                    "🖼️ Optional image by replying to your suggestion",
+        description="Drop ideas to improve the server.\n\n💡 Submit an idea\n👍 Community votes\n🛠️ Mods set status\n🖼️ Attach Image / No Image buttons on your post",
         color=0xEB459E
     )
-    embed.set_footer(text="Admin note: this channel is now the suggestion channel for this server.")
+    embed.set_footer(text="This channel is now the suggestion channel for this server.")
     await ctx.send(embed=embed, view=SuggestionPanelView())
 
 
@@ -690,7 +800,7 @@ async def panel2(ctx: commands.Context):
         save_data_atomic(DATA)
     embed = discord.Embed(
         title="🧾 Logs Enabled",
-        description="This channel is now the log channel for confessions + suggestions.\nOnly staff should see this.",
+        description="This channel is now the log channel for confessions + suggestions.",
         color=0x5865F2
     )
     await ctx.send(embed=embed)
