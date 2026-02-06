@@ -12,11 +12,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
 
-GUILD_ID = 417323686018940928
-CONFESSION_CHANNEL_ID = 1461951872364449984
-LOG_CHANNEL_ID = 1461951962965868680
-SUGGESTION_CHANNEL_ID = 1469255656513998941
-
 DATA_FILE = "confessions.json"
 
 CONF_ID_RE = re.compile(r"#(\d+)")
@@ -31,7 +26,8 @@ def _default_data():
         "message_to_confession": {},
         "suggestion_count": 0,
         "suggestions": {},
-        "message_to_suggestion": {}
+        "message_to_suggestion": {},
+        "guild_config": {}
     }
 
 
@@ -43,6 +39,8 @@ def load_data():
             data = json.load(f)
         for k, v in _default_data().items():
             data.setdefault(k, v)
+        if not isinstance(data.get("guild_config"), dict):
+            data["guild_config"] = {}
         return data
     except Exception:
         return _default_data()
@@ -58,6 +56,52 @@ def save_data_atomic(data):
 DATA = load_data()
 
 
+def get_guild_cfg(guild_id: int):
+    return DATA["guild_config"].setdefault(str(guild_id), {})
+
+
+def set_guild_cfg(guild_id: int, **kwargs):
+    cfg = get_guild_cfg(guild_id)
+    for k, v in kwargs.items():
+        cfg[k] = v
+
+
+def status_label(status: str):
+    return {
+        "pending": "🟨 Pending Review",
+        "approved": "🟩 Approved",
+        "denied": "🟥 Denied",
+        "implemented": "✅ Implemented",
+    }.get(status, "🟨 Pending Review")
+
+
+def _rebuild_embed_from(embed: discord.Embed, *, fields, footer_text=None):
+    new_embed = discord.Embed(
+        title=embed.title,
+        description=embed.description,
+        color=embed.color.value if embed.color else 0xEB459E,
+        timestamp=embed.timestamp
+    )
+    if embed.author and embed.author.name:
+        try:
+            new_embed.set_author(name=embed.author.name, icon_url=embed.author.icon_url)
+        except Exception:
+            new_embed.set_author(name=embed.author.name)
+    if embed.thumbnail and embed.thumbnail.url:
+        new_embed.set_thumbnail(url=embed.thumbnail.url)
+    if embed.image and embed.image.url:
+        new_embed.set_image(url=embed.image.url)
+    if footer_text is None:
+        if embed.footer and embed.footer.text:
+            new_embed.set_footer(text=embed.footer.text)
+    else:
+        new_embed.set_footer(text=footer_text)
+
+    for name, value, inline in fields[:25]:
+        new_embed.add_field(name=name, value=value, inline=inline)
+    return new_embed
+
+
 class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
     confession = ui.TextInput(
         label="Your Confession",
@@ -68,15 +112,23 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or interaction.guild.id != GUILD_ID:
-            return await interaction.response.send_message("❌ Wrong server.", ephemeral=True)
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
 
         guild = interaction.guild
-        confession_channel = guild.get_channel(CONFESSION_CHANNEL_ID)
-        log_channel = guild.get_channel(LOG_CHANNEL_ID)
+        async with data_lock:
+            cfg = get_guild_cfg(guild.id)
+            confession_channel_id = cfg.get("confession_channel_id")
+            log_channel_id = cfg.get("log_channel_id")
 
-        if confession_channel is None or log_channel is None:
-            return await interaction.response.send_message("❌ Channels not found. Check IDs.", ephemeral=True)
+        if not confession_channel_id:
+            return await interaction.response.send_message("❌ Confession panel not set. Run `!panel` in the channel you want.", ephemeral=True)
+
+        confession_channel = guild.get_channel(int(confession_channel_id))
+        log_channel = guild.get_channel(int(log_channel_id)) if log_channel_id else None
+
+        if confession_channel is None:
+            return await interaction.response.send_message("❌ Confession channel not found. Run `!panel` again.", ephemeral=True)
 
         text = escape_mentions(self.confession.value).strip()
         if not text:
@@ -92,7 +144,7 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
             color=0x5865F2,
             timestamp=datetime.utcnow()
         )
-        confession_embed.set_footer(text="Use the buttons below to submit or reply anonymously.")
+        confession_embed.set_footer(text="Reply anonymously using the button below.")
 
         msg = await confession_channel.send(embed=confession_embed, view=ConfessionPersistentView())
 
@@ -105,6 +157,7 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 "message_id": msg.id,
                 "channel_id": confession_channel.id,
+                "guild_id": guild.id,
                 "jump_url": msg.jump_url,
                 "thread_id": None,
                 "replies": []
@@ -112,20 +165,25 @@ class ConfessionModal(ui.Modal, title="Submit an Anonymous Confession"):
             DATA["message_to_confession"][str(msg.id)] = cid
             save_data_atomic(DATA)
 
-        log_embed = discord.Embed(
-            title=f"🔒 Confession #{cid} — Log",
-            color=0xED4245,
-            timestamp=datetime.utcnow()
-        )
-        log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
-        log_embed.add_field(name="Account Created", value=interaction.user.created_at.strftime("%Y-%m-%d"), inline=True)
-        if isinstance(interaction.user, discord.Member) and interaction.user.joined_at:
-            log_embed.add_field(name="Joined Server", value=interaction.user.joined_at.strftime("%Y-%m-%d"), inline=True)
-        log_embed.add_field(name="Confession", value=text[:1024], inline=False)
-        log_embed.add_field(name="Message Link", value=f"[Jump to confession]({msg.jump_url})", inline=False)
-        log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        if log_channel:
+            log_embed = discord.Embed(
+                title=f"🔒 Confession #{cid} — Log",
+                color=0xED4245,
+                timestamp=datetime.utcnow()
+            )
+            log_embed.add_field(name="Server", value=f"{guild.name} (`{guild.id}`)", inline=False)
+            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+            log_embed.add_field(name="Account Created", value=interaction.user.created_at.strftime("%Y-%m-%d"), inline=True)
+            if isinstance(interaction.user, discord.Member) and interaction.user.joined_at:
+                log_embed.add_field(name="Joined Server", value=interaction.user.joined_at.strftime("%Y-%m-%d"), inline=True)
+            log_embed.add_field(name="Confession", value=text[:1024], inline=False)
+            log_embed.add_field(name="Message Link", value=f"[Jump]({msg.jump_url})", inline=False)
+            log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            try:
+                await log_channel.send(embed=log_embed)
+            except Exception:
+                pass
 
-        await log_channel.send(embed=log_embed)
         await interaction.response.send_message("✅ Confession submitted anonymously.", ephemeral=True)
 
 
@@ -144,15 +202,17 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
         self.confession_message = confession_message
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or interaction.guild.id != GUILD_ID:
-            return await interaction.response.send_message("❌ Wrong server.", ephemeral=True)
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
 
         guild = interaction.guild
-        confession_channel = guild.get_channel(CONFESSION_CHANNEL_ID)
-        log_channel = guild.get_channel(LOG_CHANNEL_ID)
+        async with data_lock:
+            cfg = get_guild_cfg(guild.id)
+            confession_channel_id = cfg.get("confession_channel_id")
+            log_channel_id = cfg.get("log_channel_id")
 
-        if confession_channel is None or log_channel is None:
-            return await interaction.response.send_message("❌ Channels not found. Check IDs.", ephemeral=True)
+        confession_channel = guild.get_channel(int(confession_channel_id)) if confession_channel_id else None
+        log_channel = guild.get_channel(int(log_channel_id)) if log_channel_id else None
 
         text = escape_mentions(self.reply.value).strip()
         if not text:
@@ -163,7 +223,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
         async with data_lock:
             rec = DATA["confessions"].get(str(cid))
             if not rec:
-                return await interaction.response.send_message("❌ Confession not found in data.", ephemeral=True)
+                return await interaction.response.send_message("❌ Confession not found.", ephemeral=True)
 
             reply_obj = {
                 "content": text,
@@ -177,9 +237,7 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
         posted_somewhere = False
         try:
             thread_id = rec.get("thread_id")
-            thread = None
-            if thread_id:
-                thread = guild.get_thread(int(thread_id))
+            thread = guild.get_thread(int(thread_id)) if thread_id else None
 
             if thread is None:
                 thread = await self.confession_message.create_thread(
@@ -199,32 +257,38 @@ class ReplyModal(ui.Modal, title="Reply Anonymously"):
             await thread.send(embed=reply_embed, allowed_mentions=discord.AllowedMentions.none())
             posted_somewhere = True
         except Exception:
-            try:
-                reply_embed = discord.Embed(
-                    title=f"Anonymous Reply → Confession #{cid}",
-                    description=f"“{text}”",
-                    color=0x99AAB5,
-                    timestamp=datetime.utcnow()
-                )
-                await confession_channel.send(embed=reply_embed, allowed_mentions=discord.AllowedMentions.none())
-                posted_somewhere = True
-            except Exception:
-                posted_somewhere = False
+            if confession_channel:
+                try:
+                    reply_embed = discord.Embed(
+                        title=f"Anonymous Reply → Confession #{cid}",
+                        description=f"“{text}”",
+                        color=0x99AAB5,
+                        timestamp=datetime.utcnow()
+                    )
+                    await confession_channel.send(embed=reply_embed, allowed_mentions=discord.AllowedMentions.none())
+                    posted_somewhere = True
+                except Exception:
+                    posted_somewhere = False
 
-        log_embed = discord.Embed(
-            title=f"🔒 Reply to Confession #{cid} — Log",
-            color=0xFEE75C,
-            timestamp=datetime.utcnow()
-        )
-        log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
-        log_embed.add_field(name="Reply", value=text[:1024], inline=False)
-        log_embed.add_field(
-            name="Confession Link",
-            value=f"[Jump]({rec.get('jump_url', self.confession_message.jump_url)})",
-            inline=False
-        )
-        log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await log_channel.send(embed=log_embed)
+        if log_channel:
+            log_embed = discord.Embed(
+                title=f"🔒 Reply to Confession #{cid} — Log",
+                color=0xFEE75C,
+                timestamp=datetime.utcnow()
+            )
+            log_embed.add_field(name="Server", value=f"{guild.name} (`{guild.id}`)", inline=False)
+            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+            log_embed.add_field(name="Reply", value=text[:1024], inline=False)
+            log_embed.add_field(
+                name="Confession Link",
+                value=f"[Jump]({rec.get('jump_url', self.confession_message.jump_url)})",
+                inline=False
+            )
+            log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            try:
+                await log_channel.send(embed=log_embed)
+            except Exception:
+                pass
 
         if posted_somewhere:
             await interaction.response.send_message("💬 Reply sent anonymously.", ephemeral=True)
@@ -263,29 +327,37 @@ class ConfessionPersistentView(ui.View):
 
 class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
     title_in = ui.TextInput(
-        label="Suggestion Title",
+        label="Title",
         placeholder="Short title (e.g., Add a music channel)",
         required=True,
         max_length=80
     )
     details = ui.TextInput(
-        label="Suggestion Details",
+        label="Details",
         style=discord.TextStyle.paragraph,
-        placeholder="Explain your suggestion clearly and why it helps.",
+        placeholder="Explain your idea clearly. Include why it helps.",
         required=True,
         max_length=1200
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or interaction.guild.id != GUILD_ID:
-            return await interaction.response.send_message("❌ Wrong server.", ephemeral=True)
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
 
         guild = interaction.guild
-        suggestion_channel = guild.get_channel(SUGGESTION_CHANNEL_ID)
-        log_channel = guild.get_channel(LOG_CHANNEL_ID)
+        async with data_lock:
+            cfg = get_guild_cfg(guild.id)
+            suggestion_channel_id = cfg.get("suggestion_channel_id")
+            log_channel_id = cfg.get("log_channel_id")
 
-        if suggestion_channel is None or log_channel is None:
-            return await interaction.response.send_message("❌ Channels not found. Check IDs.", ephemeral=True)
+        if not suggestion_channel_id:
+            return await interaction.response.send_message("❌ Suggestion panel not set. Run `!suggestionpanel` in the channel you want.", ephemeral=True)
+
+        suggestion_channel = guild.get_channel(int(suggestion_channel_id))
+        log_channel = guild.get_channel(int(log_channel_id)) if log_channel_id else None
+
+        if suggestion_channel is None:
+            return await interaction.response.send_message("❌ Suggestion channel not found. Run `!suggestionpanel` again.", ephemeral=True)
 
         title = escape_mentions(self.title_in.value).strip()
         text = escape_mentions(self.details.value).strip()
@@ -297,19 +369,22 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
             sid = int(DATA["suggestion_count"])
 
         embed = discord.Embed(
-            title=f"💡 Suggestion (#{sid}) — {title}",
-            description=text,
+            title=f"✨ Suggestion #{sid}",
+            description=f"**{title}**\n\n{text}",
             color=0xEB459E,
             timestamp=datetime.utcnow()
         )
-        embed.add_field(name="Status", value="🟨 **Pending Review**", inline=True)
+        embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+        embed.add_field(name="Status", value=f"**{status_label('pending')}**", inline=True)
         embed.add_field(name="Votes", value="👍 0  |  👎 0", inline=True)
-        embed.set_footer(text="Vote below • Mods can update status • Reply to this suggestion with 1 image to attach")
+        embed.add_field(name="Attachment", value="Reply to this suggestion with **1 image** within **90s** (optional).", inline=False)
+        embed.set_footer(text="Vote below • Mods can update status")
 
         msg = await suggestion_channel.send(embed=embed, view=SuggestionView())
 
         async with data_lock:
             DATA["suggestions"][str(sid)] = {
+                "guild_id": guild.id,
                 "title": title,
                 "content": text,
                 "status": "pending",
@@ -326,20 +401,25 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
             DATA["message_to_suggestion"][str(msg.id)] = sid
             save_data_atomic(DATA)
 
-        log_embed = discord.Embed(
-            title=f"📥 Suggestion #{sid} — Log",
-            color=0x57F287,
-            timestamp=datetime.utcnow()
-        )
-        log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
-        log_embed.add_field(name="Title", value=title, inline=False)
-        log_embed.add_field(name="Suggestion", value=text[:1024], inline=False)
-        log_embed.add_field(name="Message Link", value=f"[Jump]({msg.jump_url})", inline=False)
-        log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await log_channel.send(embed=log_embed)
+        if log_channel:
+            log_embed = discord.Embed(
+                title=f"📥 Suggestion #{sid} — Log",
+                color=0x57F287,
+                timestamp=datetime.utcnow()
+            )
+            log_embed.add_field(name="Server", value=f"{guild.name} (`{guild.id}`)", inline=False)
+            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+            log_embed.add_field(name="Title", value=title, inline=False)
+            log_embed.add_field(name="Suggestion", value=text[:1024], inline=False)
+            log_embed.add_field(name="Message Link", value=f"[Jump]({msg.jump_url})", inline=False)
+            log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            try:
+                await log_channel.send(embed=log_embed)
+            except Exception:
+                pass
 
         await interaction.response.send_message(
-            "✅ Suggestion posted! Optional image: go to the suggestion channel and **reply to your suggestion** with an image within **60s**.",
+            "✅ Posted! Optional image: reply to your suggestion message with an image within **90 seconds** (or ignore).",
             ephemeral=True
         )
 
@@ -353,9 +433,11 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
                     return False
                 if m.reference is None or m.reference.message_id is None:
                     return False
-                return int(m.reference.message_id) == int(msg.id)
+                if int(m.reference.message_id) != int(msg.id):
+                    return False
+                return True
 
-            img_msg = await bot.wait_for("message", timeout=60.0, check=check)
+            img_msg = await bot.wait_for("message", timeout=90.0, check=check)
             attachment = img_msg.attachments[0]
 
             async with data_lock:
@@ -367,14 +449,11 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
             try:
                 original = await suggestion_channel.fetch_message(msg.id)
                 if original and original.embeds:
-                    new_embed = original.embeds[0]
+                    e = original.embeds[0]
+                    fields = [(f.name, f.value, f.inline) for f in e.fields]
+                    new_embed = _rebuild_embed_from(e, fields=fields)
                     new_embed.set_image(url=attachment.url)
                     await original.edit(embed=new_embed, view=SuggestionView())
-            except Exception:
-                pass
-
-            try:
-                await img_msg.reply("✅ Image attached to the suggestion!", mention_author=False)
             except Exception:
                 pass
 
@@ -387,10 +466,10 @@ class SuggestionModal(ui.Modal, title="Submit a Suggestion"):
 class SuggestionStatusSelect(ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Pending Review", value="pending", emoji="🟨", description="Default status"),
-            discord.SelectOption(label="Approved", value="approved", emoji="🟩", description="Accepted / will do"),
-            discord.SelectOption(label="Denied", value="denied", emoji="🟥", description="Not moving forward"),
-            discord.SelectOption(label="Implemented", value="implemented", emoji="✅", description="Already done"),
+            discord.SelectOption(label="Pending Review", value="pending", emoji="🟨"),
+            discord.SelectOption(label="Approved", value="approved", emoji="🟩"),
+            discord.SelectOption(label="Denied", value="denied", emoji="🟥"),
+            discord.SelectOption(label="Implemented", value="implemented", emoji="✅"),
         ]
         super().__init__(
             placeholder="🛠️ Moderator: Update status…",
@@ -405,15 +484,15 @@ class SuggestionStatusSelect(ui.Select):
             return await interaction.response.send_message("❌ Mods only (Manage Server required).", ephemeral=True)
 
         message = interaction.message
-        if message is None:
-            return await interaction.response.send_message("❌ No message context.", ephemeral=True)
+        if message is None or not message.embeds:
+            return await interaction.response.send_message("❌ Missing embed.", ephemeral=True)
 
         async with data_lock:
             sid = DATA["message_to_suggestion"].get(str(message.id))
 
-        if sid is None and message.embeds:
-            title = message.embeds[0].title or ""
-            m = SUGG_ID_RE.search(title)
+        if sid is None:
+            t = message.embeds[0].title or ""
+            m = SUGG_ID_RE.search(t)
             if m:
                 sid = int(m.group(1))
 
@@ -421,39 +500,20 @@ class SuggestionStatusSelect(ui.Select):
             return await interaction.response.send_message("❌ Can't detect suggestion ID.", ephemeral=True)
 
         new_status = self.values[0]
-        status_label = {
-            "pending": "🟨 **Pending Review**",
-            "approved": "🟩 **Approved**",
-            "denied": "🟥 **Denied**",
-            "implemented": "✅ **Implemented**",
-        }.get(new_status, "🟨 **Pending Review**")
+        label = status_label(new_status)
 
-        if not message.embeds:
-            return await interaction.response.send_message("❌ Missing embed.", ephemeral=True)
-
-        embed = message.embeds[0]
-        fields = list(embed.fields)
-
-        replaced = False
-        for i, f in enumerate(fields):
-            if f.name.lower() == "status":
-                fields[i] = discord.EmbedField(name="Status", value=status_label, inline=True)
-                replaced = True
+        e = message.embeds[0]
+        fields = [(f.name, f.value, f.inline) for f in e.fields]
+        updated = False
+        for i, (name, value, inline) in enumerate(fields):
+            if name.lower() == "status":
+                fields[i] = ("Status", f"**{label}**", True)
+                updated = True
                 break
-        if not replaced:
-            fields.insert(0, discord.EmbedField(name="Status", value=status_label, inline=True))
+        if not updated:
+            fields.insert(0, ("Status", f"**{label}**", True))
 
-        new_embed = discord.Embed(
-            title=embed.title,
-            description=embed.description,
-            color=embed.color.value if embed.color else 0xEB459E,
-            timestamp=embed.timestamp
-        )
-        if embed.image and embed.image.url:
-            new_embed.set_image(url=embed.image.url)
-        new_embed.set_footer(text=embed.footer.text if embed.footer else "Vote below • Mods can update status")
-        for f in fields[:25]:
-            new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
+        new_embed = _rebuild_embed_from(e, fields=fields)
 
         async with data_lock:
             rec = DATA["suggestions"].get(str(sid))
@@ -462,7 +522,7 @@ class SuggestionStatusSelect(ui.Select):
                 save_data_atomic(DATA)
 
         await message.edit(embed=new_embed, view=SuggestionView())
-        await interaction.response.send_message(f"✅ Status updated to **{new_status}**.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Status updated to **{label}**.", ephemeral=True)
 
 
 class SuggestionView(ui.View):
@@ -478,23 +538,23 @@ class SuggestionView(ui.View):
     async def downvote(self, interaction: discord.Interaction, button: ui.Button):
         await self._vote(interaction, up=False)
 
-    @ui.button(label="Link", emoji="🔗", style=discord.ButtonStyle.secondary, custom_id="suggestion:link")
+    @ui.button(label="Open", emoji="🔗", style=discord.ButtonStyle.secondary, custom_id="suggestion:link")
     async def link(self, interaction: discord.Interaction, button: ui.Button):
         msg = interaction.message
         if not msg:
             return await interaction.response.send_message("❌ No message.", ephemeral=True)
-        await interaction.response.send_message(f"🔗 {msg.jump_url}", ephemeral=True)
+        await interaction.response.send_message(msg.jump_url, ephemeral=True)
 
     async def _vote(self, interaction: discord.Interaction, up: bool):
         msg = interaction.message
-        if msg is None:
-            return await interaction.response.send_message("❌ No message context.", ephemeral=True)
+        if msg is None or not msg.embeds:
+            return await interaction.response.send_message("❌ Missing embed.", ephemeral=True)
 
         async with data_lock:
             sid = DATA["message_to_suggestion"].get(str(msg.id))
-            if sid is None and msg.embeds:
-                title = msg.embeds[0].title or ""
-                m = SUGG_ID_RE.search(title)
+            if sid is None:
+                t = msg.embeds[0].title or ""
+                m = SUGG_ID_RE.search(t)
                 if m:
                     sid = int(m.group(1))
 
@@ -529,34 +589,20 @@ class SuggestionView(ui.View):
             up_count = len(rec["upvotes"])
             down_count = len(rec["downvotes"])
 
-        if not msg.embeds:
-            return await interaction.response.send_message("❌ Missing embed.", ephemeral=True)
-
-        embed = msg.embeds[0]
+        e = msg.embeds[0]
+        fields = [(f.name, f.value, f.inline) for f in e.fields]
         votes_value = f"👍 {up_count}  |  👎 {down_count}"
 
-        fields = list(embed.fields)
-        replaced = False
-        for i, f in enumerate(fields):
-            if f.name.lower() == "votes":
-                fields[i] = discord.EmbedField(name="Votes", value=votes_value, inline=True)
-                replaced = True
+        updated = False
+        for i, (name, value, inline) in enumerate(fields):
+            if name.lower() == "votes":
+                fields[i] = ("Votes", votes_value, True)
+                updated = True
                 break
-        if not replaced:
-            fields.append(discord.EmbedField(name="Votes", value=votes_value, inline=True))
+        if not updated:
+            fields.append(("Votes", votes_value, True))
 
-        new_embed = discord.Embed(
-            title=embed.title,
-            description=embed.description,
-            color=embed.color.value if embed.color else 0xEB459E,
-            timestamp=embed.timestamp
-        )
-        if embed.image and embed.image.url:
-            new_embed.set_image(url=embed.image.url)
-        new_embed.set_footer(text=embed.footer.text if embed.footer else "Vote below • Mods can update status")
-        for f in fields[:25]:
-            new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
-
+        new_embed = _rebuild_embed_from(e, fields=fields)
         await msg.edit(embed=new_embed, view=SuggestionView())
         await interaction.response.send_message("✅ Vote updated.", ephemeral=True)
 
@@ -565,14 +611,20 @@ class SuggestionPanelView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @ui.button(
-        label="Submit Suggestion",
-        emoji="💡",
-        style=discord.ButtonStyle.primary,
-        custom_id="suggestion:open_modal"
-    )
+    @ui.button(label="Submit Suggestion", emoji="💡", style=discord.ButtonStyle.primary, custom_id="suggestion:open_modal")
     async def open_modal(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(SuggestionModal())
+
+    @ui.button(label="How it works", emoji="📌", style=discord.ButtonStyle.secondary, custom_id="suggestion:how")
+    async def how(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(
+            "1) Click **Submit Suggestion**\n"
+            "2) Fill title + details\n"
+            "3) Optional: reply to your posted suggestion with **one image** within **90s**\n"
+            "4) Vote with 👍/👎\n"
+            "5) Mods update status using the dropdown",
+            ephemeral=True
+        )
 
 
 class HiraBot(commands.Bot):
@@ -593,23 +645,55 @@ async def on_ready():
 @bot.command(name="panel")
 @commands.has_permissions(administrator=True)
 async def panel(ctx: commands.Context):
+    if not ctx.guild:
+        return
+    async with data_lock:
+        set_guild_cfg(ctx.guild.id, confession_channel_id=ctx.channel.id)
+        save_data_atomic(DATA)
     embed = discord.Embed(
         title="💌 Anonymous Confessions",
         description="Click **Submit a confession!** to post anonymously.\nUse **Reply** under a confession to reply anonymously.",
         color=0x57F287
     )
+    embed.set_footer(text="Admin note: this channel is now the confession channel for this server.")
     await ctx.send(embed=embed, view=ConfessionPersistentView())
 
 
-@bot.command(name="suggestpanel")
+@bot.command(name="suggestionpanel")
 @commands.has_permissions(administrator=True)
-async def suggestpanel(ctx: commands.Context):
+async def suggestionpanel(ctx: commands.Context):
+    if not ctx.guild:
+        return
+    async with data_lock:
+        set_guild_cfg(ctx.guild.id, suggestion_channel_id=ctx.channel.id)
+        save_data_atomic(DATA)
     embed = discord.Embed(
-        title="🌈 Server Suggestions",
-        description="Click **Submit Suggestion** to send an idea.\n✅ Community can vote • 🛠️ Mods can change status • 📎 Reply with an image to attach",
+        title="✨ Suggestions Box",
+        description="Drop ideas to improve the server.\n\n"
+                    "💡 Submit an idea\n"
+                    "👍 Community votes\n"
+                    "🛠️ Mods set status\n"
+                    "🖼️ Optional image by replying to your suggestion",
         color=0xEB459E
     )
+    embed.set_footer(text="Admin note: this channel is now the suggestion channel for this server.")
     await ctx.send(embed=embed, view=SuggestionPanelView())
+
+
+@bot.command(name="panel2")
+@commands.has_permissions(administrator=True)
+async def panel2(ctx: commands.Context):
+    if not ctx.guild:
+        return
+    async with data_lock:
+        set_guild_cfg(ctx.guild.id, log_channel_id=ctx.channel.id)
+        save_data_atomic(DATA)
+    embed = discord.Embed(
+        title="🧾 Logs Enabled",
+        description="This channel is now the log channel for confessions + suggestions.\nOnly staff should see this.",
+        color=0x5865F2
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="rebuildmap")
